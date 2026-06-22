@@ -24,8 +24,12 @@ jobs:
       # Configure these in repo Settings -> Secrets and variables -> Actions.
       AWS_REGION: ${{ vars.AWS_REGION }}
       S3_BUCKET: ${{ vars.S3_BUCKET }}
-      # Optional key prefix inside the bucket, e.g. "kernels". Defaults to "kernels".
-      S3_PREFIX: ${{ vars.S3_PREFIX || 'kernels' }}
+      # Base prefix. Holds the rolling "latest" .deb (version stripped from the
+      # filename, overwritten every release) plus a versions/ subfolder.
+      ARTIFACTS_PREFIX: ${{ vars.ARTIFACTS_PREFIX || 'artifacts' }}
+      # Subfolder under ARTIFACTS_PREFIX where each permanent, versioned build
+      # is kept (filename keeps the version).
+      VERSIONS_SUBDIR: ${{ vars.VERSIONS_SUBDIR || 'versions' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -113,9 +117,21 @@ jobs:
             exit 1
           fi
           version="${{ steps.pin.outputs.VERSION }}"
-          dest="s3://${S3_BUCKET}/${S3_PREFIX}/${version}/"
-          echo "Uploading $(ls dist/*.deb) -> ${dest}"
-          aws s3 cp dist/ "${dest}" --recursive --exclude '*' --include '*.deb'
-          # Also publish a stable "latest" pointer for this version line.
-          aws s3 cp dist/ "s3://${S3_BUCKET}/${S3_PREFIX}/latest/" \
+
+          # 1) Permanent, versioned copies: keep the original .deb filenames
+          #    (which carry the version) under artifacts/versions/.
+          aws s3 cp dist/ "s3://${S3_BUCKET}/${ARTIFACTS_PREFIX}/${VERSIONS_SUBDIR}/" \
             --recursive --exclude '*' --include '*.deb'
+
+          # 2) Rolling "latest" copies directly under artifacts/: strip the
+          #    version from each filename so the key is stable and overwrites
+          #    every release.
+          for f in dist/*.deb; do
+            base="$(basename "$f")"
+            # Remove the version token (and any separator glued to it), then
+            # collapse the separators left behind so e.g.
+            #   linux-image-7.1.0-jade_7.1.0_amd64.deb -> linux-image-jade_amd64.deb
+            stable="$(echo "$base" | sed -E "s/[-_]?${version//./\\.}//g; s/_{2,}/_/g; s/-{2,}/-/g; s/[-_]+\./\./g")"
+            echo "latest: ${base} -> ${stable}"
+            aws s3 cp "$f" "s3://${S3_BUCKET}/${ARTIFACTS_PREFIX}/${stable}"
+          done
