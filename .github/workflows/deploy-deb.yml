@@ -1,13 +1,16 @@
 name: Build & Deploy Debian Kernel Package
 
 # Builds a binary Debian kernel package (.deb) and uploads it to S3.
-# Triggered whenever kernel.pin changes on the default branch.
+# Triggered whenever kernel.pin changes on the default branch, or manually
+# (use the manual run to pick up workflow fixes without bumping the pin --
+# re-running a failed job replays the OLD workflow file, not the latest).
 on:
   push:
     branches:
       - master
     paths:
       - 'kernel.pin'
+  workflow_dispatch:
 
 permissions:
   contents: read
