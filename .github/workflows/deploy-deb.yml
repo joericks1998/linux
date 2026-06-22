@@ -1,0 +1,121 @@
+name: Build & Deploy Debian Kernel Package
+
+# Builds a binary Debian kernel package (.deb) and uploads it to S3.
+# Triggered whenever kernel.pin changes on the default branch.
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - 'kernel.pin'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-deb-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      # Configure these in repo Settings -> Secrets and variables -> Actions.
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      S3_BUCKET: ${{ vars.S3_BUCKET }}
+      # Optional key prefix inside the bucket, e.g. "kernels". Defaults to "kernels".
+      S3_PREFIX: ${{ vars.S3_PREFIX || 'kernels' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read kernel.pin
+        id: pin
+        run: |
+          set -euo pipefail
+          if [[ ! -f kernel.pin ]]; then
+            echo "kernel.pin not found" >&2
+            exit 1
+          fi
+          # Export every KEY=VALUE line (skipping comments/blanks) to GITHUB_OUTPUT.
+          while IFS='=' read -r key value; do
+            [[ -z "$key" || "$key" == \#* ]] && continue
+            key="$(echo "$key" | tr -d '[:space:]')"
+            value="$(echo "$value" | sed 's/[[:space:]]*$//')"
+            [[ -z "$key" ]] && continue
+            echo "$key=$value" >> "$GITHUB_OUTPUT"
+            echo "pinned $key=$value"
+          done < kernel.pin
+
+      - name: Install build dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bc bison flex libssl-dev libelf-dev \
+            dpkg-dev fakeroot rsync kmod cpio
+
+      - name: Configure kernel
+        run: |
+          set -euo pipefail
+          # Start from a sane default config, then drop debug/trusted-key knobs
+          # that break unattended CI builds.
+          make defconfig
+          scripts/config --disable SYSTEM_TRUSTED_KEYS || true
+          scripts/config --disable SYSTEM_REVOCATION_KEYS || true
+          scripts/config --disable DEBUG_INFO_BTF || true
+          make olddefconfig
+
+      - name: Build Debian binary package
+        run: |
+          set -euo pipefail
+          make -j"$(nproc)" \
+            LOCALVERSION="${{ steps.pin.outputs.LOCALVERSION }}" \
+            KDEB_PKGVERSION="${{ steps.pin.outputs.VERSION }}" \
+            bindeb-pkg
+
+      - name: Collect artifacts
+        id: collect
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          # bindeb-pkg drops the .deb files in the parent directory.
+          shopt -s nullglob
+          debs=(../*.deb)
+          if [[ ${#debs[@]} -eq 0 ]]; then
+            echo "No .deb produced" >&2
+            exit 1
+          fi
+          mv "${debs[@]}" dist/
+          ls -la dist/
+          echo "count=${#debs[@]}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload build artifacts to workflow
+        uses: actions/upload-artifact@v4
+        with:
+          name: debian-packages
+          path: dist/*.deb
+          if-no-files-found: error
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Upload to S3
+        run: |
+          set -euo pipefail
+          if [[ -z "${S3_BUCKET:-}" ]]; then
+            echo "S3_BUCKET variable is not set" >&2
+            exit 1
+          fi
+          version="${{ steps.pin.outputs.VERSION }}"
+          dest="s3://${S3_BUCKET}/${S3_PREFIX}/${version}/"
+          echo "Uploading $(ls dist/*.deb) -> ${dest}"
+          aws s3 cp dist/ "${dest}" --recursive --exclude '*' --include '*.deb'
+          # Also publish a stable "latest" pointer for this version line.
+          aws s3 cp dist/ "s3://${S3_BUCKET}/${S3_PREFIX}/latest/" \
+            --recursive --exclude '*' --include '*.deb'

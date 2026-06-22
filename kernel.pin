@@ -1,0 +1,4 @@
+# Pinned kernel build metadata. Consumed by .github/workflows/deploy-deb.yml
+# Format: KEY=VALUE, one per line. Lines starting with # are ignored.
+VERSION=7.1.0
+LOCALVERSION=-jade
